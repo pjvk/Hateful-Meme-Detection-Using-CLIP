@@ -1,4 +1,4 @@
-"""Train frozen CLIP + MLP classifier on Facebook Hateful Memes."""
+"""Train multimodal hateful meme classifiers (CLIP+MLP, CLIP+BERT, cross-attention)."""
 
 from __future__ import annotations
 
@@ -13,22 +13,40 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.dataset import HatefulMemesDataset, collate_batch
-from src.model import CLIPMLPClassifier
+from src.models_registry import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_CHECKPOINTS,
+    DEFAULT_EPOCHS,
+    DEFAULT_LR,
+    MODEL_CHOICES,
+    build_model,
+    get_trainable_parameters,
+    save_checkpoint,
+    uses_bert,
+)
 from src.utils import ensure_dir, get_device, set_seed, setup_logging
 
 
+def forward_batch(model: nn.Module, batch: dict, model_name: str) -> torch.Tensor:
+    """Run model forward pass for the selected architecture."""
+    if model_name == "clip_mlp":
+        return model(batch["image"], batch["text_tokens"])
+    return model(batch["image"], batch["bert_input_ids"], batch["bert_attention_mask"])
+
+
 def run_epoch(
-    model: CLIPMLPClassifier,
+    model: nn.Module,
+    model_name: str,
     loader: DataLoader,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer | None,
     device: torch.device,
     train: bool = True,
 ) -> tuple[float, float]:
-    """One pass over the dataloader; returns (avg_loss, accuracy)."""
     if train:
         model.train()
-        model.clip_model.eval()  # CLIP stays in eval mode (frozen)
+        if hasattr(model, "clip_model"):
+            model.clip_model.eval()
     else:
         model.eval()
 
@@ -43,7 +61,15 @@ def run_epoch(
             text_tokens = batch["text_tokens"].to(device)
             labels = batch["label"].to(device)
 
-            logits = model(images, text_tokens)
+            model_batch = {
+                "image": images,
+                "text_tokens": text_tokens,
+            }
+            if uses_bert(model_name):
+                model_batch["bert_input_ids"] = batch["bert_input_ids"].to(device)
+                model_batch["bert_attention_mask"] = batch["bert_attention_mask"].to(device)
+
+            logits = forward_batch(model, model_batch, model_name)
             loss = criterion(logits, labels)
 
             if train and optimizer is not None:
@@ -62,34 +88,41 @@ def run_epoch(
 
 
 def train(
+    model_name: str,
     data_dir: str | Path,
-    epochs: int = 5,
-    batch_size: int = 32,
-    lr: float = 1e-3,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    clip_model_name: str = "ViT-B/32",
     hidden_dim: int = 512,
     dropout: float = 0.3,
     checkpoint_path: str | Path | None = None,
     seed: int = 42,
 ) -> Path:
-    """Full training loop with validation tracking."""
     set_seed(seed)
     device = get_device()
     data_dir = Path(data_dir)
 
-    model = CLIPMLPClassifier(hidden_dim=hidden_dim, dropout=dropout)
+    model = build_model(model_name, clip_model_name, hidden_dim, dropout)
     model.to(device)
 
+    use_bert = uses_bert(model_name)
     train_ds = HatefulMemesDataset(
         jsonl_path=data_dir / "train.jsonl",
         data_dir=data_dir,
         preprocess=model.preprocess,
-        tokenizer=clip.tokenize,
+        clip_tokenizer=clip.tokenize,
+        clip_model_name=clip_model_name,
+        use_bert=use_bert,
     )
     val_ds = HatefulMemesDataset(
         jsonl_path=data_dir / "dev.jsonl",
         data_dir=data_dir,
         preprocess=model.preprocess,
-        tokenizer=clip.tokenize,
+        clip_tokenizer=clip.tokenize,
+        clip_model_name=clip_model_name,
+        use_bert=use_bert,
+        bert_tokenizer=train_ds.bert_tokenizer if use_bert else None,
     )
 
     train_loader = DataLoader(
@@ -108,18 +141,18 @@ def train(
     )
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.classifier.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(get_trainable_parameters(model, model_name), lr=lr)
 
-    out_path = Path(checkpoint_path) if checkpoint_path else ensure_dir("checkpoints") / "clip_mlp.pt"
+    out_path = Path(checkpoint_path or DEFAULT_CHECKPOINTS[model_name])
     ensure_dir(out_path.parent)
 
     best_val_acc = 0.0
     for epoch in range(1, epochs + 1):
         train_loss, train_acc = run_epoch(
-            model, train_loader, criterion, optimizer, device, train=True
+            model, model_name, train_loader, criterion, optimizer, device, train=True
         )
         val_loss, val_acc = run_epoch(
-            model, val_loader, criterion, None, device, train=False
+            model, model_name, val_loader, criterion, None, device, train=False
         )
         logging.info(
             "Epoch %d/%d | train_loss=%.4f train_acc=%.4f | val_loss=%.4f val_acc=%.4f",
@@ -133,45 +166,58 @@ def train(
 
         if val_acc >= best_val_acc:
             best_val_acc = val_acc
-            torch.save(
-                {
-                    # Save MLP only (~2MB); CLIP weights are re-downloaded at load time
-                    "classifier_state_dict": model.classifier.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "epoch": epoch,
-                    "val_accuracy": val_acc,
-                    "hidden_dim": hidden_dim,
-                    "dropout": dropout,
-                },
+            save_checkpoint(
                 out_path,
+                model,
+                model_name,
+                optimizer,
+                epoch,
+                val_acc,
+                clip_model_name,
+                hidden_dim,
+                dropout,
             )
-            logging.info("Saved best checkpoint to %s", out_path)
+            logging.info("Saved checkpoint → %s (val_acc=%.4f)", out_path, val_acc)
 
     return out_path
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train CLIP + MLP classifier")
+    parser = argparse.ArgumentParser(description="Train hateful meme detection models")
+    parser.add_argument("--model", type=str, default="clip_mlp", choices=MODEL_CHOICES)
     parser.add_argument("--data-dir", type=str, default="data")
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--clip-model", type=str, default="ViT-B/32")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.3)
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/clip_mlp.pt")
+    parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    model_name = args.model
+    epochs = args.epochs or DEFAULT_EPOCHS[model_name]
+    batch_size = args.batch_size or DEFAULT_BATCH_SIZE[model_name]
+    lr = args.lr or DEFAULT_LR[model_name]
+    checkpoint = args.checkpoint or DEFAULT_CHECKPOINTS[model_name]
+
     setup_logging()
-    logging.info("Device: %s", get_device())
+    logging.info("Device     : %s", get_device())
+    logging.info("Model      : %s", model_name)
+    logging.info("CLIP       : %s", args.clip_model)
+    logging.info("Epochs/LR  : %d / %g", epochs, lr)
+
     train(
+        model_name=model_name,
         data_dir=args.data_dir,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        clip_model_name=args.clip_model,
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
-        checkpoint_path=args.checkpoint,
+        checkpoint_path=checkpoint,
         seed=args.seed,
     )
 

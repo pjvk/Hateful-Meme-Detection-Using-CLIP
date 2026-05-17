@@ -1,4 +1,4 @@
-"""Evaluate trained CLIP + MLP model with classification metrics."""
+"""Evaluate trained models with classification metrics."""
 
 from __future__ import annotations
 
@@ -21,55 +21,69 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.dataset import HatefulMemesDataset, collate_batch
-from src.model import load_clip_mlp
+from src.models_registry import (
+    DEFAULT_CHECKPOINTS,
+    MODEL_CHOICES,
+    load_model_for_eval,
+    uses_bert,
+)
+from src.train import forward_batch
 from src.utils import get_device, setup_logging
 
 LABEL_NAMES = ["Non-Hateful", "Hateful"]
+
+MODEL_TITLES = {
+    "clip_mlp": "Frozen CLIP + MLP",
+    "clip_bert": "CLIP + BERT Fusion",
+    "clip_bert_cross": "CLIP + BERT + Cross-Attention",
+}
 
 
 @torch.no_grad()
 def collect_predictions(
     model,
+    model_name: str,
     loader: DataLoader,
     device: torch.device,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Run model on loader; return labels, preds, probabilities."""
+) -> tuple[np.ndarray, np.ndarray]:
     model.eval()
     all_labels: list[int] = []
     all_preds: list[int] = []
-    all_probs: list[list[float]] = []
 
     for batch in tqdm(loader, desc="Evaluating"):
         images = batch["image"].to(device)
         text_tokens = batch["text_tokens"].to(device)
         labels = batch["label"]
 
-        logits = model(images, text_tokens)
-        probs = torch.softmax(logits, dim=1).cpu().numpy()
+        model_batch = {"image": images, "text_tokens": text_tokens}
+        if uses_bert(model_name):
+            model_batch["bert_input_ids"] = batch["bert_input_ids"].to(device)
+            model_batch["bert_attention_mask"] = batch["bert_attention_mask"].to(device)
+
+        logits = forward_batch(model, model_batch, model_name)
         preds = logits.argmax(dim=1).cpu().numpy()
 
         all_labels.extend(labels.tolist())
         all_preds.extend(preds.tolist())
-        all_probs.extend(probs.tolist())
 
-    return (
-        np.array(all_labels),
-        np.array(all_preds),
-        np.array(all_probs),
-    )
+    return np.array(all_labels), np.array(all_preds)
 
 
-def print_evaluation_report(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
-    """Print metrics and confusion matrix; return metric dict."""
+def print_evaluation_report(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    model_name: str,
+) -> dict[str, float]:
     acc = accuracy_score(y_true, y_pred)
     prec = precision_score(y_true, y_pred, average="binary", zero_division=0)
     rec = recall_score(y_true, y_pred, average="binary", zero_division=0)
     f1 = f1_score(y_true, y_pred, average="binary", zero_division=0)
     cm = confusion_matrix(y_true, y_pred)
+    title = MODEL_TITLES.get(model_name, model_name)
 
-    print("\n" + "=" * 50)
-    print("EVALUATION REPORT — CLIP + MLP")
-    print("=" * 50)
+    print("\n" + "=" * 55)
+    print(f"EVALUATION — {title}")
+    print("=" * 55)
     print(f"Accuracy:  {acc:.4f}")
     print(f"Precision: {prec:.4f}")
     print(f"Recall:    {rec:.4f}")
@@ -78,34 +92,39 @@ def print_evaluation_report(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str,
     print(f"              Pred {LABEL_NAMES[0]}  Pred {LABEL_NAMES[1]}")
     print(f"True {LABEL_NAMES[0]:12} {cm[0, 0]:6d}  {cm[0, 1]:6d}")
     print(f"True {LABEL_NAMES[1]:12} {cm[1, 0]:6d}  {cm[1, 1]:6d}")
-    print("\nDetailed classification report:")
+    print("\nClassification report:")
     print(classification_report(y_true, y_pred, target_names=LABEL_NAMES, digits=4))
-    print("=" * 50 + "\n")
+    print("=" * 55 + "\n")
 
     return {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1}
 
 
 def evaluate_split(
+    model_name: str,
     data_dir: str | Path,
     split: str = "dev",
-    checkpoint: str | Path = "checkpoints/clip_mlp.pt",
+    checkpoint: str | Path | None = None,
     batch_size: int = 32,
+    clip_model_name: str = "ViT-B/32",
 ) -> dict[str, float]:
-    checkpoint = Path(checkpoint)
+    checkpoint = Path(checkpoint or DEFAULT_CHECKPOINTS[model_name])
     if not checkpoint.exists():
-        raise FileNotFoundError(
-            f"Checkpoint not found: {checkpoint}. Train first with: python -m src.train"
-        )
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}. Train with --model {model_name}")
 
     device = get_device()
-    model = load_clip_mlp(checkpoint_path=checkpoint, device=device)
+    model = load_model_for_eval(model_name, checkpoint, clip_model_name=clip_model_name, device=device)
+
+    if uses_bert(model_name):
+        batch_size = min(batch_size, 16)
 
     data_dir = Path(data_dir)
     dataset = HatefulMemesDataset(
         jsonl_path=data_dir / f"{split}.jsonl",
         data_dir=data_dir,
         preprocess=model.preprocess,
-        tokenizer=clip.tokenize,
+        clip_tokenizer=clip.tokenize,
+        clip_model_name=clip_model_name,
+        use_bert=uses_bert(model_name),
     )
     loader = DataLoader(
         dataset,
@@ -116,30 +135,30 @@ def evaluate_split(
     )
 
     if len(dataset) > 0 and "label" not in dataset.samples[0]:
-        raise ValueError(
-            f"Split '{split}' has no labels (e.g. official test.jsonl). "
-            "Use --split dev or --split train for evaluation."
-        )
+        raise ValueError(f"Split '{split}' has no labels. Use dev or train.")
 
-    y_true, y_pred, _ = collect_predictions(model, loader, device)
-    return print_evaluation_report(y_true, y_pred)
+    y_true, y_pred = collect_predictions(model, model_name, loader, device)
+    return print_evaluation_report(y_true, y_pred, model_name)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate CLIP + MLP model")
+    parser = argparse.ArgumentParser(description="Evaluate hateful meme models")
+    parser.add_argument("--model", type=str, default="clip_mlp", choices=MODEL_CHOICES)
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--split", type=str, default="dev", choices=["train", "dev", "test"])
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/clip_mlp.pt")
+    parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--clip-model", type=str, default="ViT-B/32")
     args = parser.parse_args()
 
     setup_logging()
-    logging.info("Device: %s", get_device())
     evaluate_split(
+        model_name=args.model,
         data_dir=args.data_dir,
         split=args.split,
         checkpoint=args.checkpoint,
         batch_size=args.batch_size,
+        clip_model_name=args.clip_model,
     )
 
 

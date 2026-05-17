@@ -38,6 +38,41 @@ def setup_logging(level: int = logging.INFO) -> None:
     )
 
 
+def verify_data_dir(data_dir: str | Path, split: str = "dev") -> Path:
+    """
+    Ensure Facebook Hateful Memes layout exists before training/eval.
+
+    Raises FileNotFoundError with setup instructions if files are missing.
+    """
+    data_dir = Path(data_dir).resolve()
+    jsonl = data_dir / f"{split}.jsonl"
+    img_dir = data_dir / "img"
+
+    missing: list[str] = []
+    if not data_dir.is_dir():
+        missing.append(f"directory not found: {data_dir}")
+    if not jsonl.is_file():
+        missing.append(f"file not found: {jsonl}")
+    if not img_dir.is_dir():
+        missing.append(f"directory not found: {img_dir}")
+
+    if missing:
+        raise FileNotFoundError(
+            "Dataset not found. Expected layout:\n"
+            "  data/\n"
+            "  ├── img/\n"
+            "  ├── train.jsonl\n"
+            "  ├── dev.jsonl\n"
+            "  └── test.jsonl\n\n"
+            "Colab fixes:\n"
+            "  1. Kaggle: python -m src.kaggle_data (see notebooks/training.ipynb)\n"
+            "  2. Google Drive: !ln -sf /content/drive/MyDrive/<PATH>/data data\n"
+            "  3. Run: !python -m src.verify_data --data-dir data\n\n"
+            "Missing:\n  - " + "\n  - ".join(missing)
+        )
+    return data_dir
+
+
 def resolve_data_path(data_dir: str | Path, relative_img: str) -> Path:
     """
     Resolve image path from JSONL 'img' field.

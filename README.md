@@ -3,146 +3,80 @@
 **Author:** Jagadeesh Venkatakumar  
 **Course:** CMPE 257 — Spring 2026
 
-Binary classification of memes as **Hateful** vs **Non-Hateful** using image and text, built on the [Facebook Hateful Memes Dataset](https://github.com/facebookresearch/fairseq/tree/main/examples/MMFT/hateful_memes).
+Binary classification of memes as **Hateful** vs **Non-Hateful** using image and text on the [Facebook Hateful Memes Dataset](https://www.kaggle.com/datasets/parthplc/facebook-hateful-meme-dataset).
 
-## Approaches
+## Models
 
-| Method | Description |
-|--------|-------------|
-| **Zero-shot CLIP** | Frozen ViT-B/32; classify via prompt similarity (`src/zeroshot.py`) |
-| **CLIP + MLP** (main) | Frozen CLIP embeddings → concat → MLP → binary logits |
+| Model | CLI `--model` | Description |
+|-------|---------------|-------------|
+| Zero-shot CLIP | — | `src.zeroshot` — no training |
+| Frozen CLIP + MLP | `clip_mlp` | Concat CLIP embeddings → MLP |
+| CLIP + BERT fusion | `clip_bert` | CLIP image + BERT text → concat → MLP |
+| CLIP + BERT + cross-attention | `clip_bert_cross` | Image attends to BERT tokens → classifier |
 
-CLIP is **not** fine-tuned; only the MLP head is trained.
+CLIP image encoders are **frozen** in all trained models. Only classification / fusion layers (and BERT for BERT-based models) are trained.
 
 ## Project structure
 
 ```
 ├── src/
-│   ├── dataset.py      # JSONL + CLIP preprocessing
-│   ├── model.py        # Frozen CLIP + MLP classifier
-│   ├── train.py        # Training loop
-│   ├── evaluate.py     # Metrics & confusion matrix
-│   ├── predict.py      # Single-meme inference
-│   ├── zeroshot.py     # Zero-shot baseline
-│   └── utils.py        # Device, paths, checkpoints
-├── api/
-│   └── main.py         # FastAPI /predict endpoint
-├── notebooks/
-│   └── training.ipynb  # Google Colab workflow
-├── requirements.txt
-├── README.md
-└── .gitignore
+│   ├── dataset.py
+│   ├── model.py                  # CLIP + MLP
+│   ├── model_bert.py             # CLIP + BERT fusion
+│   ├── model_cross_attention.py  # CLIP + BERT + cross-attention
+│   ├── models_registry.py        # Factory & checkpoints
+│   ├── train.py / evaluate.py / zeroshot.py / predict.py
+│   └── verify_data.py
+├── api/main.py
+├── notebooks/training.ipynb      # Google Colab workflow
+└── checkpoints/                  # .pt files (gitignored)
 ```
 
-## Dataset setup
+## Quick start (Colab)
 
-Download the Facebook Hateful Memes dataset and arrange files as:
+1. Open `notebooks/training.ipynb` in Google Colab (GPU enabled).
+2. Clone repo, install deps, set Kaggle token, download data.
+3. Run each model section; download checkpoints when done.
 
-```
-data/
-├── img/
-├── train.jsonl
-├── dev.jsonl
-└── test.jsonl
-```
-
-Example JSONL line:
-
-```json
-{"id": 42953, "img": "img/42953.png", "label": 1, "text": "caption text here"}
-```
-
-`data/` is gitignored — do not commit images or labels.
-
-## Installation
+## Local commands
 
 ```bash
-git clone <your-repo-url>
-cd CMPE257_PROJECT
-python -m venv venv
-# Windows
-venv\Scripts\activate
-# Linux / macOS / Colab
-source venv/bin/activate
-
 pip install -r requirements.txt
-```
 
-## Training (local or Colab)
-
-From the **project root**:
-
-```bash
-python -m src.train --data-dir data --epochs 5 --batch-size 32 --lr 1e-3
-```
-
-Checkpoint saved to `checkpoints/clip_mlp.pt` (~2MB, MLP weights only; CLIP is not stored). File is gitignored.
-
-**Note:** Official `test.jsonl` has no public labels — evaluate on `dev` or `train`, not `test`.
-
-### Google Colab
-
-1. Clone repo: `!git clone <repo> && %cd CMPE257_PROJECT`
-2. Install: `!pip install -r requirements.txt`
-3. Upload or mount `data/` (Drive: `!ln -s /content/drive/MyDrive/hateful_memes/data data`)
-4. Open `notebooks/training.ipynb` or run:
-
-```python
-!python -m src.train --data-dir data --epochs 5
-```
-
-5. Download `checkpoints/clip_mlp.pt` for local API use.
-
-## Zero-shot baseline
-
-```bash
+# Zero-shot
 python -m src.zeroshot --data-dir data --split dev
+
+# Train
+python -m src.train --model clip_mlp --data-dir data
+python -m src.train --model clip_bert --data-dir data
+python -m src.train --model clip_bert_cross --data-dir data
+
+# Evaluate
+python -m src.evaluate --model clip_mlp --data-dir data --split dev
 ```
 
-## Evaluation
+## Dataset
+
+Place data under `data/` (see `data/README.md`) or use Kaggle in Colab:
 
 ```bash
-python -m src.evaluate --data-dir data --split dev --checkpoint checkpoints/clip_mlp.pt
+python -m src.kaggle_data
 ```
 
-Reports accuracy, precision, recall, F1, and confusion matrix.
+Official `test.jsonl` has no public labels — evaluate on **dev**.
 
-## Single prediction (CLI)
+## Checkpoints
+
+Saved under `checkpoints/` (gitignored). **Do not push `.pt` files to GitHub.** Download from Colab after training.
+
+## API (CLIP + MLP)
 
 ```bash
-python -m src.predict --image data/img/42953.png --text "optional caption" --checkpoint checkpoints/clip_mlp.pt
+uvicorn api.main:app --reload --port 8000
 ```
 
-## API
-
-Place trained weights at `checkpoints/clip_mlp.pt`, then:
-
-```bash
-uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-- Docs: http://localhost:8000/docs  
-- Health: `GET /health`  
-- Predict: `POST /predict` (multipart form: `image` file, optional `text`)
-
-Example with curl:
-
-```bash
-curl -X POST "http://localhost:8000/predict" \
-  -F "image=@data/img/42953.png" \
-  -F "text=meme caption here"
-```
-
-Response:
-
-```json
-{"label": "Hateful", "confidence": 0.91}
-```
-
-## Literature comparison
-
-CNN + BERT results from prior papers can be cited in your report; this repo implements **CLIP zero-shot** and **CLIP + MLP** only.
+Requires `checkpoints/clip_mlp.pt` locally.
 
 ## License
 
-MIT License — Copyright (c) 2026 Jagadeesh Venkatakumar. See [LICENSE](LICENSE).
+MIT — Copyright (c) 2026 Jagadeesh Venkatakumar. See [LICENSE](LICENSE).
