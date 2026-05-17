@@ -10,33 +10,40 @@ import torch.nn as nn
 
 from src.model import CLIPMLPClassifier
 from src.model_bert import CLIPBERTFusion
+from src.model_coattention import CLIPBERTCoAttention
 from src.model_cross_attention import CLIPBERTCrossAttention
 
-MODEL_CHOICES = ("clip_mlp", "clip_bert", "clip_bert_cross")
+MODEL_CHOICES = ("clip_mlp", "clip_bert", "clip_bert_cross", "clip_bert_coattn")
 
 DEFAULT_CHECKPOINTS = {
     "clip_mlp": "checkpoints/clip_mlp.pt",
     "clip_bert": "checkpoints/clip_bert.pt",
     "clip_bert_cross": "checkpoints/clip_bert_cross.pt",
+    "clip_bert_coattn": "checkpoints/clip_bert_coattn.pt",
 }
 
 DEFAULT_EPOCHS = {
     "clip_mlp": 10,
     "clip_bert": 10,
     "clip_bert_cross": 12,
+    "clip_bert_coattn": 15,
 }
 
 DEFAULT_LR = {
     "clip_mlp": 1e-3,
     "clip_bert": 5e-5,
     "clip_bert_cross": 2e-5,
+    "clip_bert_coattn": 2e-5,
 }
 
 DEFAULT_BATCH_SIZE = {
     "clip_mlp": 32,
     "clip_bert": 16,
     "clip_bert_cross": 16,
+    "clip_bert_coattn": 16,
 }
+
+CONTRASTIVE_LOSS_WEIGHT = 0.2
 
 
 def build_model(
@@ -64,11 +71,21 @@ def build_model(
             hidden_dim=hidden_dim,
             dropout=dropout,
         )
+    if model_name == "clip_bert_coattn":
+        return CLIPBERTCoAttention(
+            clip_model_name=clip_model_name,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
+        )
     raise ValueError(f"Unknown model: {model_name}. Choose from {MODEL_CHOICES}")
 
 
 def uses_bert(model_name: str) -> bool:
-    return model_name in ("clip_bert", "clip_bert_cross")
+    return model_name in ("clip_bert", "clip_bert_cross", "clip_bert_coattn")
+
+
+def uses_contrastive_loss(model_name: str) -> bool:
+    return model_name == "clip_bert_coattn"
 
 
 def get_trainable_parameters(model: nn.Module, model_name: str) -> list[torch.nn.Parameter]:
@@ -88,22 +105,23 @@ def save_checkpoint(
     clip_model_name: str,
     hidden_dim: int,
     dropout: float,
+    val_auroc: float | None = None,
 ) -> None:
     """Save trainable weights only (compact checkpoints)."""
     trainable = {k: v for k, v in model.state_dict().items() if k in _trainable_keys(model)}
-    torch.save(
-        {
-            "model_name": model_name,
-            "trainable_state_dict": trainable,
-            "optimizer_state_dict": optimizer.state_dict(),
-            "epoch": epoch,
-            "val_accuracy": val_accuracy,
-            "clip_model_name": clip_model_name,
-            "hidden_dim": hidden_dim,
-            "dropout": dropout,
-        },
-        path,
-    )
+    payload: dict[str, Any] = {
+        "model_name": model_name,
+        "trainable_state_dict": trainable,
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": epoch,
+        "val_accuracy": val_accuracy,
+        "clip_model_name": clip_model_name,
+        "hidden_dim": hidden_dim,
+        "dropout": dropout,
+    }
+    if val_auroc is not None:
+        payload["val_auroc"] = val_auroc
+    torch.save(payload, path)
 
 
 def _trainable_keys(model: nn.Module) -> set[str]:

@@ -13,6 +13,7 @@ Binary classification of memes as **Hateful** vs **Non-Hateful** using image and
 | Frozen CLIP + MLP | `clip_mlp` | Concat CLIP embeddings → MLP |
 | CLIP + BERT fusion | `clip_bert` | CLIP image + BERT text → concat → MLP |
 | CLIP + BERT + cross-attention | `clip_bert_cross` | Image attends to BERT tokens → classifier |
+| CLIP + BERT + **co-attention** | `clip_bert_coattn` | **Bidirectional** image↔text attention + contrastive loss (best) |
 
 CLIP image encoders are **frozen** in all trained models. Only classification / fusion layers (and BERT for BERT-based models) are trained.
 
@@ -24,6 +25,7 @@ CLIP image encoders are **frozen** in all trained models. Only classification / 
 │   ├── model.py                  # CLIP + MLP
 │   ├── model_bert.py             # CLIP + BERT fusion
 │   ├── model_cross_attention.py  # CLIP + BERT + cross-attention
+│   ├── model_coattention.py      # CLIP + BERT + bidirectional co-attention
 │   ├── models_registry.py        # Factory & checkpoints
 │   ├── train.py / evaluate.py / zeroshot.py / predict.py
 │   └── verify_data.py
@@ -50,6 +52,7 @@ python -m src.zeroshot --data-dir data --split dev
 python -m src.train --model clip_mlp --data-dir data
 python -m src.train --model clip_bert --data-dir data
 python -m src.train --model clip_bert_cross --data-dir data
+python -m src.train --model clip_bert_coattn --data-dir data
 
 # Evaluate
 python -m src.evaluate --model clip_mlp --data-dir data --split dev

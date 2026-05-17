@@ -16,6 +16,7 @@ from sklearn.metrics import (
     f1_score,
     precision_score,
     recall_score,
+    roc_auc_score,
 )
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -36,6 +37,7 @@ MODEL_TITLES = {
     "clip_mlp": "Frozen CLIP + MLP",
     "clip_bert": "CLIP + BERT Fusion",
     "clip_bert_cross": "CLIP + BERT + Cross-Attention",
+    "clip_bert_coattn": "CLIP + BERT + Bidirectional Co-Attention",
 }
 
 
@@ -45,10 +47,11 @@ def collect_predictions(
     model_name: str,
     loader: DataLoader,
     device: torch.device,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     model.eval()
     all_labels: list[int] = []
     all_preds: list[int] = []
+    all_probs: list[float] = []
 
     for batch in tqdm(loader, desc="Evaluating"):
         images = batch["image"].to(device)
@@ -61,18 +64,21 @@ def collect_predictions(
             model_batch["bert_attention_mask"] = batch["bert_attention_mask"].to(device)
 
         logits = forward_batch(model, model_batch, model_name)
+        probs = torch.softmax(logits, dim=1).cpu().numpy()
         preds = logits.argmax(dim=1).cpu().numpy()
 
         all_labels.extend(labels.tolist())
         all_preds.extend(preds.tolist())
+        all_probs.extend(probs[:, 1].tolist())
 
-    return np.array(all_labels), np.array(all_preds)
+    return np.array(all_labels), np.array(all_preds), np.array(all_probs)
 
 
 def print_evaluation_report(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     model_name: str,
+    y_prob: np.ndarray | None = None,
 ) -> dict[str, float]:
     acc = accuracy_score(y_true, y_pred)
     prec = precision_score(y_true, y_pred, average="binary", zero_division=0)
@@ -81,10 +87,15 @@ def print_evaluation_report(
     cm = confusion_matrix(y_true, y_pred)
     title = MODEL_TITLES.get(model_name, model_name)
 
+    auroc = 0.0
+    if y_prob is not None and len(np.unique(y_true)) > 1:
+        auroc = float(roc_auc_score(y_true, y_prob))
+
     print("\n" + "=" * 55)
     print(f"EVALUATION — {title}")
     print("=" * 55)
     print(f"Accuracy:  {acc:.4f}")
+    print(f"AUROC:     {auroc:.4f}")
     print(f"Precision: {prec:.4f}")
     print(f"Recall:    {rec:.4f}")
     print(f"F1-score:  {f1:.4f}")
@@ -96,7 +107,7 @@ def print_evaluation_report(
     print(classification_report(y_true, y_pred, target_names=LABEL_NAMES, digits=4))
     print("=" * 55 + "\n")
 
-    return {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1}
+    return {"accuracy": acc, "auroc": auroc, "precision": prec, "recall": rec, "f1": f1}
 
 
 def evaluate_split(
@@ -137,8 +148,8 @@ def evaluate_split(
     if len(dataset) > 0 and "label" not in dataset.samples[0]:
         raise ValueError(f"Split '{split}' has no labels. Use dev or train.")
 
-    y_true, y_pred = collect_predictions(model, model_name, loader, device)
-    return print_evaluation_report(y_true, y_pred, model_name)
+    y_true, y_pred, y_prob = collect_predictions(model, model_name, loader, device)
+    return print_evaluation_report(y_true, y_pred, model_name, y_prob)
 
 
 def main() -> None:

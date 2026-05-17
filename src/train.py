@@ -7,13 +7,17 @@ import logging
 from pathlib import Path
 
 import clip
+import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.dataset import HatefulMemesDataset, collate_batch
+from src.model_coattention import supervised_contrastive_loss
 from src.models_registry import (
+    CONTRASTIVE_LOSS_WEIGHT,
     DEFAULT_BATCH_SIZE,
     DEFAULT_CHECKPOINTS,
     DEFAULT_EPOCHS,
@@ -23,6 +27,7 @@ from src.models_registry import (
     get_trainable_parameters,
     save_checkpoint,
     uses_bert,
+    uses_contrastive_loss,
 )
 from src.utils import ensure_dir, get_device, set_seed, setup_logging
 
@@ -34,6 +39,29 @@ def forward_batch(model: nn.Module, batch: dict, model_name: str) -> torch.Tenso
     return model(batch["image"], batch["bert_input_ids"], batch["bert_attention_mask"])
 
 
+def compute_batch_loss(
+    model: nn.Module,
+    model_name: str,
+    batch: dict,
+    labels: torch.Tensor,
+    criterion: nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Classification loss; co-attention model adds supervised contrastive term."""
+    if uses_contrastive_loss(model_name):
+        fused = model.encode_multimodal(
+            batch["image"],
+            batch["bert_input_ids"],
+            batch["bert_attention_mask"],
+        )
+        logits = model.classifier(fused)
+        ce = criterion(logits, labels)
+        contrastive = supervised_contrastive_loss(fused, labels)
+        return ce + CONTRASTIVE_LOSS_WEIGHT * contrastive, logits
+
+    logits = forward_batch(model, batch, model_name)
+    return criterion(logits, labels), logits
+
+
 def run_epoch(
     model: nn.Module,
     model_name: str,
@@ -42,7 +70,8 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None,
     device: torch.device,
     train: bool = True,
-) -> tuple[float, float]:
+    collect_auroc: bool = False,
+) -> tuple[float, float, float | None]:
     if train:
         model.train()
         if hasattr(model, "clip_model"):
@@ -53,6 +82,8 @@ def run_epoch(
     total_loss = 0.0
     correct = 0
     total = 0
+    all_labels: list[int] = []
+    all_probs: list[float] = []
 
     context = torch.enable_grad() if train else torch.no_grad()
     with context:
@@ -69,8 +100,7 @@ def run_epoch(
                 model_batch["bert_input_ids"] = batch["bert_input_ids"].to(device)
                 model_batch["bert_attention_mask"] = batch["bert_attention_mask"].to(device)
 
-            logits = forward_batch(model, model_batch, model_name)
-            loss = criterion(logits, labels)
+            loss, logits = compute_batch_loss(model, model_name, model_batch, labels, criterion)
 
             if train and optimizer is not None:
                 optimizer.zero_grad()
@@ -82,9 +112,19 @@ def run_epoch(
             correct += (preds == labels).sum().item()
             total += labels.size(0)
 
+            if collect_auroc:
+                prob_hateful = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
+                all_labels.extend(labels.cpu().tolist())
+                all_probs.extend(prob_hateful.tolist())
+
     avg_loss = total_loss / total if total else 0.0
     accuracy = correct / total if total else 0.0
-    return avg_loss, accuracy
+
+    val_auroc = None
+    if collect_auroc and all_labels and len(np.unique(all_labels)) > 1:
+        val_auroc = float(roc_auc_score(np.array(all_labels), np.array(all_probs)))
+
+    return avg_loss, accuracy, val_auroc
 
 
 def train(
@@ -147,25 +187,45 @@ def train(
     ensure_dir(out_path.parent)
 
     best_val_acc = 0.0
+    best_val_auroc = 0.0
+    select_by_auroc = model_name == "clip_bert_coattn"
+
     for epoch in range(1, epochs + 1):
-        train_loss, train_acc = run_epoch(
+        train_loss, train_acc, _ = run_epoch(
             model, model_name, train_loader, criterion, optimizer, device, train=True
         )
-        val_loss, val_acc = run_epoch(
-            model, model_name, val_loader, criterion, None, device, train=False
+        val_loss, val_acc, val_auroc = run_epoch(
+            model,
+            model_name,
+            val_loader,
+            criterion,
+            None,
+            device,
+            train=False,
+            collect_auroc=select_by_auroc,
         )
+        auroc_str = f" val_auroc={val_auroc:.4f}" if val_auroc is not None else ""
         logging.info(
-            "Epoch %d/%d | train_loss=%.4f train_acc=%.4f | val_loss=%.4f val_acc=%.4f",
+            "Epoch %d/%d | train_loss=%.4f train_acc=%.4f | val_loss=%.4f val_acc=%.4f%s",
             epoch,
             epochs,
             train_loss,
             train_acc,
             val_loss,
             val_acc,
+            auroc_str,
         )
 
-        if val_acc >= best_val_acc:
-            best_val_acc = val_acc
+        improved = (
+            val_auroc is not None and val_auroc > best_val_auroc
+            if select_by_auroc
+            else val_acc >= best_val_acc
+        )
+        if improved:
+            if select_by_auroc and val_auroc is not None:
+                best_val_auroc = val_auroc
+            else:
+                best_val_acc = val_acc
             save_checkpoint(
                 out_path,
                 model,
@@ -176,8 +236,10 @@ def train(
                 clip_model_name,
                 hidden_dim,
                 dropout,
+                val_auroc=val_auroc,
             )
-            logging.info("Saved checkpoint → %s (val_acc=%.4f)", out_path, val_acc)
+            metric = val_auroc if select_by_auroc else val_acc
+            logging.info("Saved checkpoint → %s (metric=%.4f)", out_path, metric)
 
     return out_path
 
