@@ -1,10 +1,18 @@
-"""Frozen CLIP (image) + BERT (text) with concat fusion and MLP classifier."""
+"""CLIP (image) + BERT (text) with concat fusion and MLP classifier."""
 
 from __future__ import annotations
+
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
 from transformers import BertModel
+
+from src.clip_finetune import (
+    clip_is_partially_trainable,
+    freeze_clip,
+    unfreeze_clip_top_layers,
+)
 
 try:
     import clip
@@ -13,13 +21,7 @@ except ImportError:
 
 
 class CLIPBERTFusion(nn.Module):
-    """
-    Multimodal fusion without cross-attention.
-
-    - CLIP ViT: frozen image encoder
-    - BERT: trainable text encoder (bert-base-uncased)
-    - Project both to hidden_dim, concat, MLP classifier
-    """
+    """CLIP image encoder + BERT text + concat fusion + MLP."""
 
     def __init__(
         self,
@@ -29,15 +31,21 @@ class CLIPBERTFusion(nn.Module):
         dropout: float = 0.3,
         num_classes: int = 2,
         freeze_bert: bool = False,
+        unfreeze_clip_layers: int = 0,
+        unfreeze_text_layers: int = 0,
     ) -> None:
         super().__init__()
         if clip is None:
             raise ImportError("Install CLIP: pip install git+https://github.com/openai/CLIP.git")
 
         self.clip_model, self.preprocess = clip.load(clip_model_name, device="cpu")
-        for p in self.clip_model.parameters():
-            p.requires_grad = False
-        self.clip_model.eval()
+        if unfreeze_clip_layers > 0 or unfreeze_text_layers > 0:
+            unfreeze_clip_top_layers(
+                self.clip_model, n_visual=unfreeze_clip_layers, n_text=unfreeze_text_layers
+            )
+        else:
+            freeze_clip(self.clip_model)
+            self.clip_model.eval()
 
         self.bert = BertModel.from_pretrained(bert_model_name)
         if freeze_bert:
@@ -57,7 +65,8 @@ class CLIPBERTFusion(nn.Module):
         )
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
+        ctx = nullcontext() if clip_is_partially_trainable(self.clip_model) else torch.no_grad()
+        with ctx:
             feats = self.clip_model.encode_image(image).float()
         return feats / feats.norm(dim=-1, keepdim=True)
 
@@ -67,12 +76,7 @@ class CLIPBERTFusion(nn.Module):
         bert_input_ids: torch.Tensor,
         bert_attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        img_feat = self.encode_image(image)
-        img_proj = self.image_proj(img_feat)
-
+        img_proj = self.image_proj(self.encode_image(image))
         bert_out = self.bert(input_ids=bert_input_ids, attention_mask=bert_attention_mask)
-        text_feat = bert_out.pooler_output
-        text_proj = self.text_proj(text_feat)
-
-        fused = torch.cat([img_proj, text_proj], dim=-1)
-        return self.classifier(fused)
+        text_proj = self.text_proj(bert_out.pooler_output)
+        return self.classifier(torch.cat([img_proj, text_proj], dim=-1))

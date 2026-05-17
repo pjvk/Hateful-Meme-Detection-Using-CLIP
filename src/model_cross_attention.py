@@ -1,10 +1,18 @@
-"""Frozen CLIP (image) + BERT (text) with cross-attention fusion."""
+"""CLIP (image) + BERT (text) with cross-attention fusion."""
 
 from __future__ import annotations
+
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
 from transformers import BertModel
+
+from src.clip_finetune import (
+    clip_is_partially_trainable,
+    freeze_clip,
+    unfreeze_clip_top_layers,
+)
 
 try:
     import clip
@@ -13,13 +21,7 @@ except ImportError:
 
 
 class CLIPBERTCrossAttention(nn.Module):
-    """
-    Image attends to BERT token sequence, then classifies.
-
-    - CLIP: frozen global image embedding -> one query token
-    - BERT: trainable token sequence -> keys/values
-    - Multi-head cross-attention + LayerNorm + MLP head
-    """
+    """CLIP image query attends to BERT tokens, then classifies."""
 
     def __init__(
         self,
@@ -30,15 +32,21 @@ class CLIPBERTCrossAttention(nn.Module):
         dropout: float = 0.3,
         num_classes: int = 2,
         freeze_bert: bool = False,
+        unfreeze_clip_layers: int = 0,
+        unfreeze_text_layers: int = 0,
     ) -> None:
         super().__init__()
         if clip is None:
             raise ImportError("Install CLIP: pip install git+https://github.com/openai/CLIP.git")
 
         self.clip_model, self.preprocess = clip.load(clip_model_name, device="cpu")
-        for p in self.clip_model.parameters():
-            p.requires_grad = False
-        self.clip_model.eval()
+        if unfreeze_clip_layers > 0 or unfreeze_text_layers > 0:
+            unfreeze_clip_top_layers(
+                self.clip_model, n_visual=unfreeze_clip_layers, n_text=unfreeze_text_layers
+            )
+        else:
+            freeze_clip(self.clip_model)
+            self.clip_model.eval()
 
         self.bert = BertModel.from_pretrained(bert_model_name)
         if freeze_bert:
@@ -62,7 +70,8 @@ class CLIPBERTCrossAttention(nn.Module):
         )
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
+        ctx = nullcontext() if clip_is_partially_trainable(self.clip_model) else torch.no_grad()
+        with ctx:
             feats = self.clip_model.encode_image(image).float()
         return feats / feats.norm(dim=-1, keepdim=True)
 
@@ -72,20 +81,12 @@ class CLIPBERTCrossAttention(nn.Module):
         bert_input_ids: torch.Tensor,
         bert_attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        img_feat = self.encode_image(image)
-        img_token = self.image_proj(img_feat).unsqueeze(1)  # [B, 1, H]
-
+        img_token = self.image_proj(self.encode_image(image)).unsqueeze(1)
         bert_out = self.bert(input_ids=bert_input_ids, attention_mask=bert_attention_mask)
-        text_tokens = self.text_proj(bert_out.last_hidden_state)  # [B, L, H]
-
-        # True = ignore position in PyTorch MHA key_padding_mask
+        text_tokens = self.text_proj(bert_out.last_hidden_state)
         key_padding_mask = bert_attention_mask == 0
-
         attn_out, _ = self.cross_attn(
-            img_token,
-            text_tokens,
-            text_tokens,
-            key_padding_mask=key_padding_mask,
+            img_token, text_tokens, text_tokens, key_padding_mask=key_padding_mask
         )
         fused = self.norm(attn_out + img_token).squeeze(1)
         return self.classifier(fused)

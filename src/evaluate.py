@@ -27,6 +27,8 @@ from src.models_registry import (
     load_model_for_eval,
     uses_bert,
 )
+
+# clip_mlp_ft checkpoints store architecture as clip_mlp with unfreeze metadata
 from src.train import forward_batch
 from src.utils import get_device, setup_logging
 
@@ -34,6 +36,7 @@ LABEL_NAMES = ["Non-Hateful", "Hateful"]
 
 MODEL_TITLES = {
     "clip_mlp": "Frozen CLIP + MLP",
+    "clip_mlp_ft": "CLIP + MLP (top-layer CLIP fine-tune)",
     "clip_bert": "CLIP + BERT Fusion",
     "clip_bert_cross": "CLIP + BERT + Cross-Attention",
 }
@@ -105,14 +108,22 @@ def evaluate_split(
     split: str = "dev",
     checkpoint: str | Path | None = None,
     batch_size: int = 32,
-    clip_model_name: str = "ViT-B/32",
+    clip_model_name: str | None = None,
 ) -> dict[str, float]:
     checkpoint = Path(checkpoint or DEFAULT_CHECKPOINTS[model_name])
     if not checkpoint.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}. Train with --model {model_name}")
 
     device = get_device()
-    model = load_model_for_eval(model_name, checkpoint, clip_model_name=clip_model_name, device=device)
+    model = load_model_for_eval(
+        model_name,
+        checkpoint,
+        clip_model_name=clip_model_name,
+        device=device,
+    )
+    if clip_model_name is None:
+        ckpt = torch.load(checkpoint, map_location="cpu")
+        clip_model_name = ckpt.get("clip_model_name", "ViT-B/32")
 
     if uses_bert(model_name):
         batch_size = min(batch_size, 16)
@@ -148,7 +159,7 @@ def main() -> None:
     parser.add_argument("--split", type=str, default="dev", choices=["train", "dev", "test"])
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--clip-model", type=str, default="ViT-B/32")
+    parser.add_argument("--clip-model", type=str, default=None)
     args = parser.parse_args()
 
     setup_logging()

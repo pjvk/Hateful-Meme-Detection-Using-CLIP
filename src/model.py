@@ -1,11 +1,18 @@
-"""Frozen CLIP feature extractor + trainable MLP classifier."""
+"""CLIP + MLP classifier with optional top-layer CLIP fine-tuning."""
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+
+from src.clip_finetune import (
+    clip_is_partially_trainable,
+    freeze_clip,
+    unfreeze_clip_top_layers,
+)
 
 try:
     import clip
@@ -15,9 +22,10 @@ except ImportError:
 
 class CLIPMLPClassifier(nn.Module):
     """
-    Multimodal classifier: frozen CLIP embeddings -> concat -> MLP -> 2 classes.
+    CLIP image + text embeddings -> concat -> MLP classifier.
 
-    CLIP parameters are frozen; only the MLP head is trained.
+    If unfreeze_clip_layers > 0, the last N visual transformer blocks
+    (and visual ln_post / proj) are trainable with a small learning rate.
     """
 
     def __init__(
@@ -26,6 +34,8 @@ class CLIPMLPClassifier(nn.Module):
         hidden_dim: int = 512,
         dropout: float = 0.3,
         num_classes: int = 2,
+        unfreeze_clip_layers: int = 0,
+        unfreeze_text_layers: int = 0,
     ) -> None:
         super().__init__()
         if clip is None:
@@ -35,10 +45,18 @@ class CLIPMLPClassifier(nn.Module):
 
         self.clip_model, self.preprocess = clip.load(clip_model_name, device="cpu")
         self.embed_dim = self.clip_model.visual.output_dim
+        self.unfreeze_clip_layers = unfreeze_clip_layers
+        self.unfreeze_text_layers = unfreeze_text_layers
 
-        for param in self.clip_model.parameters():
-            param.requires_grad = False
-        self.clip_model.eval()
+        if unfreeze_clip_layers > 0 or unfreeze_text_layers > 0:
+            unfreeze_clip_top_layers(
+                self.clip_model,
+                n_visual=unfreeze_clip_layers,
+                n_text=unfreeze_text_layers,
+            )
+        else:
+            freeze_clip(self.clip_model)
+            self.clip_model.eval()
 
         input_dim = self.embed_dim * 2
         self.classifier = nn.Sequential(
@@ -49,19 +67,19 @@ class CLIPMLPClassifier(nn.Module):
         )
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            return self.clip_model.encode_image(image).float()
+        ctx = nullcontext() if clip_is_partially_trainable(self.clip_model) else torch.no_grad()
+        with ctx:
+            feats = self.clip_model.encode_image(image).float()
+        return feats / feats.norm(dim=-1, keepdim=True)
 
     def encode_text(self, text_tokens: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            return self.clip_model.encode_text(text_tokens).float()
+        ctx = nullcontext() if clip_is_partially_trainable(self.clip_model) else torch.no_grad()
+        with ctx:
+            feats = self.clip_model.encode_text(text_tokens).float()
+        return feats / feats.norm(dim=-1, keepdim=True)
 
     def forward(self, image: torch.Tensor, text_tokens: torch.Tensor) -> torch.Tensor:
-        image_emb = self.encode_image(image)
-        text_emb = self.encode_text(text_tokens)
-        image_emb = image_emb / image_emb.norm(dim=-1, keepdim=True)
-        text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
-        fused = torch.cat([image_emb, text_emb], dim=-1)
+        fused = torch.cat([self.encode_image(image), self.encode_text(text_tokens)], dim=-1)
         return self.classifier(fused)
 
 
@@ -72,32 +90,16 @@ def load_clip_mlp(
     hidden_dim: int = 512,
     dropout: float = 0.3,
 ) -> CLIPMLPClassifier:
-    """Build model and optionally load trained MLP weights."""
-    from src.utils import (
-        default_checkpoint_path,
-        get_device,
-        load_checkpoint,
-        read_checkpoint_config,
-    )
+    """Build CLIP+MLP and load checkpoint (uses registry for metadata)."""
+    from src.models_registry import load_model_for_eval
+    from src.utils import default_checkpoint_path, get_device
 
-    if device is None:
-        device = get_device()
-
-    path = Path(checkpoint_path) if checkpoint_path else default_checkpoint_path()
-    if path.exists():
-        cfg = read_checkpoint_config(path)
-        hidden_dim = cfg["hidden_dim"]
-        dropout = cfg["dropout"]
-
-    model = CLIPMLPClassifier(
+    path = checkpoint_path or default_checkpoint_path()
+    return load_model_for_eval(
+        "clip_mlp",
+        path,
         clip_model_name=clip_model_name,
         hidden_dim=hidden_dim,
         dropout=dropout,
+        device=device or get_device(),
     )
-    if path.exists():
-        from src.models_registry import load_checkpoint_into_model
-
-        load_checkpoint_into_model(path, model, device=device)
-    model.to(device)
-    model.eval()
-    return model
