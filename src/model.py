@@ -95,7 +95,9 @@ def load_clip_mlp(
         dropout=dropout,
     )
     if path.exists():
-        load_checkpoint(path, model, map_location=device)
+        from src.models_registry import load_checkpoint_into_model
+
+        load_checkpoint_into_model(path, model, device=device)
     model.to(device)
     model.eval()
     return model

@@ -89,6 +89,7 @@ def main() -> None:
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--split", type=str, default="dev", choices=["train", "dev", "test"])
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--clip-model", type=str, default="ViT-B/32")
     args = parser.parse_args()
 
     setup_logging()
@@ -98,7 +99,7 @@ def main() -> None:
     data_dir = Path(args.data_dir)
     jsonl = data_dir / f"{args.split}.jsonl"
 
-    clip_model, preprocess = clip.load("ViT-B/32", device=device)
+    clip_model, preprocess = clip.load(args.clip_model, device=device)
     clip_model.eval()
 
     dataset = HatefulMemesDataset(
